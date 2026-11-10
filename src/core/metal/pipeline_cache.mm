@@ -96,6 +96,18 @@ private:
     PipelineArchive() {
         const char* v = std::getenv("WINEMETALGL_PIPELINE_CACHE");
         if (v && !std::strcmp(v, "0")) return;
+        /* Under Rosetta the core runs translated, and Metal's archiver then
+         * fails again and again ("cannot pack", gpuarchiver), each try
+         * serializing the whole archive and recompiling every pipeline's
+         * functions: the cache costs more than it saves. Loading an archive
+         * written before still works. WINEMETALGL_PIPELINE_CACHE set to
+         * anything but "0" keeps saving on. */
+        int translated = 0;
+        size_t translatedSize = sizeof(translated);
+        if (!v && sysctlbyname("sysctl.proc_translated", &translated, &translatedSize, nullptr, 0) == 0 && translated) {
+            archiving_ = false;
+            WMGL_INFO(Pipeline, "pipeline cache: saving off under Rosetta (WINEMETALGL_PIPELINE_CACHE=1 keeps it on)");
+        }
         std::string dir;
         if (v && *v) dir = v;
         else if (const char* home = std::getenv("HOME")) dir = std::string(home) + "/Library/Caches/WineMetalGL/pipelines";
@@ -174,7 +186,7 @@ private:
     }
 
     void finish() {
-        if (!enabled_) return;
+        if (!enabled_ || !archiving_) return;
         stopping_ = true;
         // The last chance for this session's pipelines: a few tries (see save()).
         dispatch_sync(queue_, ^{
@@ -183,7 +195,7 @@ private:
     }
 
     void add(MTLRenderPipelineDescriptor* desc) {
-        if (full_ || !enabled_) return;
+        if (full_ || !enabled_ || !archiving_) return;
         dispatch_async(queue_, ^{
             if (stopping_) return;
             @autoreleasepool {
@@ -256,13 +268,17 @@ private:
                 return false;
             }
             // Each try runs Metal's archiver over the whole archive (CPU time
-            // the game is using): 3, 6, then 12 s apart, then not again until
-            // new pipelines come (they are still in writing_ for that save).
+            // the game is using): 3, 6, then 12 s apart. Past that the saves
+            // are not working on this machine (under Rosetta, commonly):
+            // archiving stops for this session rather than paying a second
+            // compile per pipeline and a serialization per save forever. The
+            // pipelines already written stay in the file.
             if (++failures_ > 3) {
-                WMGL_INFO(Pipeline, "pipeline cache: not saved after %d tries (%s); saving again with the next new pipelines",
+                WMGL_INFO(Pipeline, "pipeline cache: not saved after %d tries (%s); saving off for this session",
                           failures_ - 1, reason ? reason : "");
                 unsaved_ = 0;
                 failures_ = 0;
+                archiving_ = false;
                 return false;
             }
             WMGL_INFO(Pipeline, "pipeline cache: not saved, trying again (%s)", reason ? reason : "");
@@ -290,6 +306,7 @@ private:
     std::atomic<bool> full_{false}, stopping_{false};
     int unsaved_ = 0;          // queue_ only
     int failures_ = 0;         // queue_ only: saves that failed since the last success
+    bool archiving_ = true;    // queue_ only (set in the constructor, before queue_ runs)
     bool saveScheduled_ = false;  // queue_ only
 };
 

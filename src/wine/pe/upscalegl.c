@@ -261,15 +261,30 @@ struct hook
     const char *dll;
     const char *name;
     void *hook;
-    void *real;  /* the export's address, as import tables hold it */
+    void *real;      /* the export's address, as import tables hold it */
+    BOOL builtin_ok; /* also patched into Wine's builtin DLLs (see below) */
 };
 
 static struct hook hooks[] =
 {
-#define X(dll, ret, name, args) {#dll ".dll", #name, (void *)hook_##name, NULL},
+#define X(dll, ret, name, args) {#dll ".dll", #name, (void *)hook_##name, NULL, FALSE},
     HOOKS
 #undef X
 };
+
+/* Wine's builtin ddraw and wined3d change and enumerate display modes
+ * themselves: without these hooks there, a DirectDraw program's mode
+ * changes reach the macOS driver for real (where they can deadlock the
+ * process) and its mode list mixes the real display's modes into the
+ * emulated ones. Only the display surface is patched into builtins; the
+ * window and message hooks stay on the program's own modules, where Wine's
+ * internals cannot call them. */
+static void mark_builtin_ok( const char *name )
+{
+    unsigned int i;
+    for (i = 0; i < ARRAY_SIZE(hooks); i++)
+        if (!strcmp( hooks[i].name, name )) { hooks[i].builtin_ok = TRUE; return; }
+}
 
 /* ------------------------------------------------- the program's windows */
 
@@ -1061,7 +1076,7 @@ static BOOL is_wine_builtin( HMODULE module )
            !memcmp( (const char *)module + 0x40, "Wine placeholder DLL", 20 );
 }
 
-static unsigned int patch_module( HMODULE module )
+static unsigned int patch_module( HMODULE module, BOOL builtin )
 {
     const BYTE *base = (const BYTE *)module;
     const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
@@ -1083,6 +1098,7 @@ static unsigned int patch_module( HMODULE module )
         {
             for (i = 0; i < ARRAY_SIZE(hooks); i++)
             {
+                if (builtin && !hooks[i].builtin_ok) continue;
                 if (!hooks[i].real || (void *)thunk->u1.Function != hooks[i].real) continue;
                 if (VirtualProtect( &thunk->u1.Function, sizeof(thunk->u1.Function), PAGE_READWRITE, &old ))
                 {
@@ -1113,11 +1129,13 @@ static void patch_modules(void)
     AcquireSRWLockExclusive( &patch_lock );
     for (i = 0; i < count; i++)
     {
+        BOOL builtin;
         for (j = 0; j < patched_count && patched[j] != modules[i]; j++);
         if (j < patched_count) continue;
         if (patched_count < ARRAY_SIZE(patched)) patched[patched_count++] = modules[i];
-        if (modules[i] == self || is_wine_builtin( modules[i] )) continue;
-        if ((j = patch_module( modules[i] )) && done_count < ARRAY_SIZE(done))
+        if (modules[i] == self) continue;
+        builtin = is_wine_builtin( modules[i] );
+        if ((j = patch_module( modules[i], builtin )) && done_count < ARRAY_SIZE(done))
         {
             done[done_count] = modules[i];
             counts[done_count++] = j;
@@ -1167,7 +1185,7 @@ static void CALLBACK dll_loaded( ULONG reason, const void *data, void *context )
     if (i == patched_count)
     {
         if (patched_count < ARRAY_SIZE(patched)) patched[patched_count++] = module;
-        if (module != self && !is_wine_builtin( module )) count = patch_module( module );
+        if (module != self) count = patch_module( module, is_wine_builtin( module ) );
     }
     ReleaseSRWLockExclusive( &patch_lock );
     if (count && loaded->full_name)
@@ -1259,6 +1277,14 @@ void upscalegl_init( HMODULE module, const char *setting )
         HMODULE dll = GetModuleHandleA( hooks[i].dll );
         hooks[i].real = dll ? (void *)GetProcAddress( dll, hooks[i].name ) : NULL;
     }
+    mark_builtin_ok( "EnumDisplaySettingsA" );
+    mark_builtin_ok( "EnumDisplaySettingsW" );
+    mark_builtin_ok( "EnumDisplaySettingsExA" );
+    mark_builtin_ok( "EnumDisplaySettingsExW" );
+    mark_builtin_ok( "ChangeDisplaySettingsA" );
+    mark_builtin_ok( "ChangeDisplaySettingsW" );
+    mark_builtin_ok( "ChangeDisplaySettingsExA" );
+    mark_builtin_ok( "ChangeDisplaySettingsExW" );
     enabled = TRUE;
     patch_modules();
     {

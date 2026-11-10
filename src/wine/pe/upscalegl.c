@@ -1072,8 +1072,20 @@ static unsigned int patched_count;
 
 static BOOL is_wine_builtin( HMODULE module )
 {
-    return !memcmp( (const char *)module + 0x40, "Wine builtin DLL", 16 ) ||
-           !memcmp( (const char *)module + 0x40, "Wine placeholder DLL", 20 );
+    if (memcmp( (const char *)module + 0x40, "Wine builtin DLL", 16 ) &&
+        memcmp( (const char *)module + 0x40, "Wine placeholder DLL", 20 ))
+    {
+        /* MetalSharp's Wine ships real-PE builtins: recognize them by their
+         * load path (the engine's own windows tree, not the app's folder). */
+        char path[MAX_PATH]; DWORD n = GetModuleFileNameA( module, path, sizeof(path) );
+        char *p;
+        if (!n || n >= sizeof(path)) return FALSE;
+        for (p = path; *p; p++) if (*p == '/') *p = '\\';
+        if (strstr( path, "\\windows\\" )) return TRUE;
+        if (strstr( path, "\\lib\\wine\\" )) return TRUE;  /* MetalSharp's engine tree */
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static unsigned int patch_module( HMODULE module, BOOL builtin )
